@@ -1,7 +1,7 @@
 """
 Shelby County, TN — Motivated Seller Lead Scraper
-v8 — Fixed checkbox matching (uses short codes: LP, JDG, LIEN, etc.)
-     Fixed date fields (start_date / end_date)
+v9 — Correct checkbox values from live site audit
+     Reduced timeouts to avoid GitHub Actions cancellation
 """
 
 import asyncio, csv, json, os, re, traceback, zipfile, io
@@ -31,15 +31,16 @@ USER_AGENT = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 
-# Actual checkbox values found on the site
+# !! Exact checkbox values from live site audit !!
 DOC_TYPES = {
-    "LP":      ("LP",     "Lis Pendens",           ["LP"]),
+    "JDG":     ("JUD",    "Judgment",              ["JDG"]),
+    "LIEN":    ("LNTAX",  "Lien",                  ["LIEN"]),
     "NOFC":    ("NOFC",   "Notice of Foreclosure", ["NOFC"]),
-    "TAXDEED": ("TAXDEED","Tax Deed",              ["TAXDEED"]),
-    "JUD":     ("JUD",    "Judgment",              ["JDG"]),
-    "LNTAX":   ("LNTAX",  "Tax Lien",              ["LIEN"]),
     "PRO":     ("PRO",    "Probate",               ["PRO"]),
-    "RELLP":   ("RELLP",  "Release",               ["REL"]),
+    "REL":     ("RELLP",  "Release",               ["REL"]),
+    "WD":      ("WD",     "Warranty Deed",         ["WD"]),
+    "DISC":    ("DISC",   "Discharge",             ["DISCHARGE"]),
+    "TRUSTDEED":("TD",    "Trust Deed",            ["TRUSTDEED"]),
 }
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -99,26 +100,23 @@ def parse_address(desc):
 
 # ── FRAME DETECTION ───────────────────────────────────────────────────────────
 async def get_search_frame(page):
-    await page.wait_for_timeout(5000)
+    await page.wait_for_timeout(2000)
 
     for frame in page.frames:
         try:
-            url  = frame.url
             html = await frame.content()
             soup = BeautifulSoup(html, "lxml")
-            has_begin = bool(soup.find(string=re.compile(r"Begin Date|start_date", re.I)))
-            has_cbs   = len(soup.find_all("input", {"type": "checkbox"}))
-            has_form  = bool(soup.find("form"))
-            print(f"[frame] {url[:80]} | begin={has_begin} cbs={has_cbs} form={has_form}")
+            has_cbs  = len(soup.find_all("input", {"type": "checkbox"}))
+            has_form = bool(soup.find("form"))
+            print(f"[frame] {frame.url[:80]} | cbs={has_cbs} form={has_form}")
             if has_cbs > 0 and has_form:
                 save_debug("search_frame", html)
-                print(f"[frame] ✓ selected this frame")
+                print(f"[frame] ✓ selected")
                 return frame
         except Exception as e:
             print(f"[frame] error: {e}")
 
-    print("[frame] no iframe with form found — using main page")
-    save_debug("search_frame_fallback", await page.content())
+    print("[frame] fallback to main page")
     return page
 
 
@@ -126,11 +124,10 @@ async def wait_for_search_form(frame):
     for selector in [
         "input[name='start_date']",
         "input[name='end_date']",
-        "input[name*='start' i]",
         "input[type='checkbox']",
     ]:
         try:
-            await frame.wait_for_selector(selector, timeout=8000)
+            await frame.wait_for_selector(selector, timeout=5000)
             print(f"[form] ready — {selector}")
             return True
         except:
@@ -160,45 +157,24 @@ async def scrape_clerk(start_dt, end_dt):
 
         print(f"[clerk] loading {CLERK_SEARCH}")
         await page.goto(CLERK_SEARCH, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(3000)
 
         DEBUG_DIR.mkdir(parents=True, exist_ok=True)
         await page.screenshot(path=str(DEBUG_DIR / "outer_page.png"), full_page=True)
         save_debug("outer_page", await page.content())
 
-        print(f"[clerk] frames on page: {len(page.frames)}")
-        for f in page.frames:
-            print(f"  frame: {f.url}")
-
         frame = await get_search_frame(page)
         await wait_for_search_form(frame)
 
-        # ── Audit form elements ───────────────────────────────────────────────
-        checkboxes  = await frame.query_selector_all("input[type='checkbox']")
-        text_inputs = await frame.query_selector_all("input[type='text'], input:not([type])")
-        selects     = await frame.query_selector_all("select")
-        print(f"[audit] checkboxes={len(checkboxes)} text_inputs={len(text_inputs)} selects={len(selects)}")
-
-        for inp in text_inputs:
-            print(f"  text: name='{await inp.get_attribute('name') or ''}' "
-                  f"id='{await inp.get_attribute('id') or ''}' "
-                  f"placeholder='{await inp.get_attribute('placeholder') or ''}'")
-
-        print("[ALL CBs]")
-        for cb in checkboxes:
-            val = await cb.get_attribute("value") or ""
-            txt = await cb.evaluate("el => el.parentElement?.innerText?.trim() || ''")
-            print(f"  cb: val='{val}' label='{txt[:80]}'")
-
         # ── Search each doc type ──────────────────────────────────────────────
-        for code, (cat, cat_label, match_strings) in DOC_TYPES.items():
+        for code, (cat, cat_label, match_vals) in DOC_TYPES.items():
             try:
                 records = await search_one_type(
                     frame, ctx, page, code, cat, cat_label,
-                    match_strings, start_str, end_str
+                    match_vals, start_str, end_str
                 )
                 all_records.extend(records)
-                print(f"[clerk] {code}: {len(records)} {'✓' if records else ''}")
+                print(f"[clerk] {code}: {len(records)} {'✓' if records else '—'}")
             except Exception as e:
                 print(f"[clerk] {code} error: {e}")
                 traceback.print_exc()
@@ -211,7 +187,7 @@ async def scrape_clerk(start_dt, end_dt):
 async def reset_form(page):
     try:
         await page.goto(CLERK_SEARCH, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(2000)
     except Exception as e:
         print(f"[reset] reload failed: {e}")
     frame = await get_search_frame(page)
@@ -220,72 +196,60 @@ async def reset_form(page):
 
 
 async def search_one_type(frame, ctx, page, code, cat, cat_label,
-                            match_strings, start_str, end_str):
+                           match_vals, start_str, end_str):
 
-    # ── 1. Uncheck all checkboxes ─────────────────────────────────────────────
-    all_cbs = await frame.query_selector_all("input[type='checkbox']")
-    for cb in all_cbs:
+    # ── 1. Uncheck all ───────────────────────────────────────────────────────
+    for cb in await frame.query_selector_all("input[type='checkbox']"):
         try:
             if await cb.is_checked():
                 await cb.click()
-                await frame.wait_for_timeout(20)
+                await frame.wait_for_timeout(15)
         except:
             pass
 
-    # ── 2. Check only our target checkbox by value ────────────────────────────
+    # ── 2. Check target by exact value ───────────────────────────────────────
     checked = False
-    all_cbs = await frame.query_selector_all("input[type='checkbox']")
-
-    for cb in all_cbs:
+    for cb in await frame.query_selector_all("input[type='checkbox']"):
         try:
-            cb_val = (await cb.get_attribute("value") or "").strip().upper()
-            for ms in match_strings:
-                if ms.upper() == cb_val:
-                    if not await cb.is_checked():
-                        await cb.click()
-                        await frame.wait_for_timeout(100)
-                    checked = True
-                    print(f"[{code}] ✓ checked checkbox: '{cb_val}'")
-                    break
-            if checked:
+            val = (await cb.get_attribute("value") or "").strip().upper()
+            if val in [m.upper() for m in match_vals]:
+                if not await cb.is_checked():
+                    await cb.click()
+                    await frame.wait_for_timeout(80)
+                checked = True
+                print(f"[{code}] ✓ checked: '{val}'")
                 break
         except Exception as e:
             print(f"[{code}] cb error: {e}")
 
     if not checked:
-        print(f"[{code}] ⚠ no matching checkbox found for {match_strings}")
+        print(f"[{code}] ⚠ no checkbox match for {match_vals} — skipping")
         return []
 
-    # ── 3. Fill start_date / end_date ─────────────────────────────────────────
+    # ── 3. Fill dates ────────────────────────────────────────────────────────
     filled = 0
-    for inp in await frame.query_selector_all("input[type='text'], input:not([type])"):
+    for inp in await frame.query_selector_all("input"):
         try:
             nm  = (await inp.get_attribute("name") or "").lower()
             id_ = (await inp.get_attribute("id")   or "").lower()
             combined = nm + " " + id_
-
             if "start_date" in combined and filled == 0:
                 await inp.triple_click()
-                await inp.fill("")
-                await inp.type(start_str, delay=50)
+                await inp.fill(start_str)
                 filled += 1
                 print(f"[{code}] ✓ start_date: {start_str}")
-
             elif "end_date" in combined and filled == 1:
                 await inp.triple_click()
-                await inp.fill("")
-                await inp.type(end_str, delay=50)
+                await inp.fill(end_str)
                 filled += 1
                 print(f"[{code}] ✓ end_date: {end_str}")
-
-        except Exception as e:
-            print(f"[{code}] date fill error: {e}")
+        except:
+            pass
 
     if filled < 2:
-        print(f"[{code}] ⚠ only filled {filled}/2 date fields")
-        save_debug(f"no_dates_{code}", await frame.content())
+        print(f"[{code}] ⚠ filled {filled}/2 date fields")
 
-    await frame.wait_for_timeout(500)
+    await frame.wait_for_timeout(300)
 
     # ── 4. Submit ─────────────────────────────────────────────────────────────
     submitted = False
@@ -296,7 +260,7 @@ async def search_one_type(frame, ctx, page, code, cat, cat_label,
         "input[value*='Search']",
     ]:
         try:
-            await frame.click(sel, timeout=5000)
+            await frame.click(sel, timeout=4000)
             submitted = True
             print(f"[{code}] submitted via '{sel}'")
             break
@@ -304,10 +268,10 @@ async def search_one_type(frame, ctx, page, code, cat, cat_label,
             pass
     if not submitted:
         await frame.keyboard.press("F2")
-        print(f"[{code}] submitted via F2 key")
+        print(f"[{code}] submitted via F2")
 
     # ── 5. Wait for results ───────────────────────────────────────────────────
-    await page.wait_for_timeout(4000)
+    await page.wait_for_timeout(3000)
 
     results_frame = frame
     for f in page.frames:
@@ -320,14 +284,9 @@ async def search_one_type(frame, ctx, page, code, cat, cat_label,
         except:
             pass
 
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(1500)
     results_html = await results_frame.content()
     save_debug(f"results_{code}", results_html)
-
-    if code == "LP":
-        await page.screenshot(
-            path=str(DEBUG_DIR / f"results_{code}.png"), full_page=True
-        )
 
     # ── 6. Try CSV download ───────────────────────────────────────────────────
     csv_records = await try_csv_download(results_frame, ctx, code, cat, cat_label)
@@ -346,7 +305,6 @@ async def try_csv_download(frame, ctx, code, cat, cat_label):
             "text=Download results into CSV file",
             "a:has-text('CSV')",
             "a:has-text('Download')",
-            "text=Export",
         ]:
             try:
                 dl_link = await frame.query_selector(sel)
@@ -357,7 +315,7 @@ async def try_csv_download(frame, ctx, code, cat, cat_label):
         if not dl_link:
             return []
 
-        async with ctx.expect_download(timeout=30000) as dl_info:
+        async with ctx.expect_download(timeout=20000) as dl_info:
             await dl_link.click()
         download = await dl_info.value
         tmp_path = f"/tmp/shelby_{code}.csv"
@@ -408,9 +366,9 @@ def parse_html_table(soup, code, cat, cat_label):
             cells = [td.get_text(strip=True) for td in tr.find_all("td")]
             if not cells or all(c == "" for c in cells):
                 continue
-            row  = dict(zip(hdrs, cells))
-            link = tr.find("a", href=True)
-            href = link["href"] if link else ""
+            row   = dict(zip(hdrs, cells))
+            link  = tr.find("a", href=True)
+            href  = link["href"] if link else ""
             clerk_url = (
                 href if href.startswith("http") else CLERK_BASE + "/" + href.lstrip("/")
             ) if href else ""
@@ -433,6 +391,7 @@ def parse_html_table(soup, code, cat, cat_label):
                 "clerk_url": clerk_url, "flags": [], "score": 0,
             })
     return records
+
 
 # ── PARCEL ENRICHMENT ─────────────────────────────────────────────────────────
 def download_parcel_dbf():
@@ -496,6 +455,7 @@ def download_parcel_dbf():
         print(f"[parcel] error: {e}")
     return owner_map
 
+
 def enrich(rec, owner_map):
     for v in name_variants(rec.get("owner", "")):
         if v in owner_map:
@@ -503,17 +463,19 @@ def enrich(rec, owner_map):
             break
     return rec
 
+
 # ── SCORING ───────────────────────────────────────────────────────────────────
 def score_record(rec, week_ago):
     flags, score = [], 30
-    cat   = rec.get("cat", ""); code = rec.get("doc_type", "")
-    amt   = rec.get("amount") or 0; filed = rec.get("filed", "")
+    cat   = rec.get("cat", "")
+    amt   = rec.get("amount") or 0
+    filed = rec.get("filed", "")
     owner = rec.get("owner", "").upper()
-    if cat == "LP":      flags.append("Lis pendens");      score += 10
-    if cat == "NOFC":    flags.append("Pre-foreclosure");  score += 10
-    if cat == "JUD":     flags.append("Judgment lien");    score += 10
-    if cat == "LNTAX":   flags.append("Tax lien");         score += 10
-    if cat == "PRO":     flags.append("Probate / estate"); score += 10
+    if cat == "LP":    flags.append("Lis pendens");      score += 10
+    if cat == "NOFC":  flags.append("Pre-foreclosure");  score += 10
+    if cat == "JUD":   flags.append("Judgment lien");    score += 10
+    if cat == "LNTAX": flags.append("Tax lien");         score += 10
+    if cat == "PRO":   flags.append("Probate / estate"); score += 10
     if re.search(r"\bLLC\b|\bINC\b|\bCORP\b", owner):
         flags.append("LLC/corp owner"); score += 10
     if amt > 100000:  score += 15; flags.append("High-value debt")
@@ -528,6 +490,7 @@ def score_record(rec, week_ago):
     rec["score"] = min(score, 100)
     return rec
 
+
 def apply_combo(records):
     oc = {}
     for r in records:
@@ -538,6 +501,7 @@ def apply_combo(records):
         if o and {"LP", "NOFC"}.issubset(oc.get(o, set())):
             r["score"] = min(r["score"] + 20, 100)
     return records
+
 
 # ── GHL CSV EXPORT ────────────────────────────────────────────────────────────
 def export_ghl(records, path):
@@ -575,6 +539,7 @@ def export_ghl(records, path):
                 "Public Records URL":     r.get("clerk_url", ""),
             })
     print(f"[export] GHL CSV → {path}")
+
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def main():
