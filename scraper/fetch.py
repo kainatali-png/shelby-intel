@@ -1,10 +1,7 @@
 """
 Shelby County, TN — Motivated Seller Lead Scraper
-v7 — Matches actual page structure:
-     • Form lives inside an iframe  ← key fix
-     • Instrument types are full-text checkboxes (e.g. "LIS PENDENS")
-     • Date fields labeled "Begin Date" / "End Date" with placeholder MM/DD/YYYY
-     • Submit = Search (F2) link
+v8 — Fixed checkbox matching (uses short codes: LP, JDG, LIEN, etc.)
+     Fixed date fields (start_date / end_date)
 """
 
 import asyncio, csv, json, os, re, traceback, zipfile, io
@@ -34,20 +31,15 @@ USER_AGENT = (
     "Chrome/122.0.0.0 Safari/537.36"
 )
 
-# Map: our code -> (category, label, substrings to match in checkbox text on the site)
+# Actual checkbox values found on the site
 DOC_TYPES = {
-    "LP":      ("LP",     "Lis Pendens",            ["LIS PENDENS"]),
-    "NOFC":    ("NOFC",   "Notice of Foreclosure",  ["NOTICE OF FORECLOSURE", "FORECLOSURE NOTICE"]),
-    "TAXDEED": ("TAXDEED","Tax Deed",               ["TAX DEED"]),
-    "JUD":     ("JUD",    "Judgment",               ["JUDGMENT", "JUDGEMENT"]),
-    "CCJ":     ("JUD",    "Certified Judgment",     ["CERTIFIED JUDG"]),
-    "LNFED":   ("LNTAX",  "Federal Tax Lien",       ["FEDERAL TAX LIEN", "FED TAX LIEN"]),
-    "LNIRS":   ("LNTAX",  "IRS Lien",               ["IRS LIEN", "IRS TAX LIEN"]),
-    "LN":      ("LN",     "Lien",                   ["LIEN"]),
-    "LNMECH":  ("LN",     "Mechanic Lien",          ["MECHANIC", "MECHANICS LIEN"]),
-    "PRO":     ("PRO",    "Probate",                ["PROBATE"]),
-    "NOC":     ("NOC",    "Notice of Commencement", ["NOTICE OF COMMENCEMENT"]),
-    "RELLP":   ("RELLP",  "Release Lis Pendens",    ["RELEASE LIS PENDENS", "REL LIS PENDENS"]),
+    "LP":      ("LP",     "Lis Pendens",           ["LP"]),
+    "NOFC":    ("NOFC",   "Notice of Foreclosure", ["NOFC"]),
+    "TAXDEED": ("TAXDEED","Tax Deed",              ["TAXDEED"]),
+    "JUD":     ("JUD",    "Judgment",              ["JDG"]),
+    "LNTAX":   ("LNTAX",  "Tax Lien",              ["LIEN"]),
+    "PRO":     ("PRO",    "Probate",               ["PRO"]),
+    "RELLP":   ("RELLP",  "Release",               ["REL"]),
 }
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -107,32 +99,23 @@ def parse_address(desc):
 
 # ── FRAME DETECTION ───────────────────────────────────────────────────────────
 async def get_search_frame(page):
-    """
-    The site renders its search form inside an iframe.
-    Find and return that frame; fall back to the main page if none found.
-    """
-    await page.wait_for_timeout(5000)  # let all iframes load
+    await page.wait_for_timeout(5000)
 
-    best = None
     for frame in page.frames:
         try:
             url  = frame.url
             html = await frame.content()
             soup = BeautifulSoup(html, "lxml")
-            has_begin = bool(soup.find(string=re.compile(r"Begin Date", re.I)))
+            has_begin = bool(soup.find(string=re.compile(r"Begin Date|start_date", re.I)))
             has_cbs   = len(soup.find_all("input", {"type": "checkbox"}))
             has_form  = bool(soup.find("form"))
             print(f"[frame] {url[:80]} | begin={has_begin} cbs={has_cbs} form={has_form}")
-            if has_begin or (has_cbs > 0 and has_form):
+            if has_cbs > 0 and has_form:
                 save_debug("search_frame", html)
                 print(f"[frame] ✓ selected this frame")
-                best = frame
-                break
+                return frame
         except Exception as e:
             print(f"[frame] error: {e}")
-
-    if best:
-        return best
 
     print("[frame] no iframe with form found — using main page")
     save_debug("search_frame_fallback", await page.content())
@@ -141,11 +124,9 @@ async def get_search_frame(page):
 
 async def wait_for_search_form(frame):
     for selector in [
-        "input[placeholder='MM/DD/YYYY']",
-        "input[name*='begin' i]",
+        "input[name='start_date']",
+        "input[name='end_date']",
         "input[name*='start' i]",
-        "text=Begin Date",
-        "text=Recorded Between",
         "input[type='checkbox']",
     ]:
         try:
@@ -203,17 +184,11 @@ async def scrape_clerk(start_dt, end_dt):
                   f"id='{await inp.get_attribute('id') or ''}' "
                   f"placeholder='{await inp.get_attribute('placeholder') or ''}'")
 
-        for cb in checkboxes[:30]:
-            cb_id  = await cb.get_attribute("id") or ""
-            cb_val = await cb.get_attribute("value") or ""
-            lbl_el = await frame.query_selector(f"label[for='{cb_id}']") if cb_id else None
-            if lbl_el:
-                lbl = (await lbl_el.inner_text()).strip()
-            else:
-                lbl = await cb.evaluate(
-                    "el => el.parentElement ? el.parentElement.innerText.trim() : ''"
-                )
-            print(f"  cb: val='{cb_val}' label='{lbl[:60]}'")
+        print("[ALL CBs]")
+        for cb in checkboxes:
+            val = await cb.get_attribute("value") or ""
+            txt = await cb.evaluate("el => el.parentElement?.innerText?.trim() || ''")
+            print(f"  cb: val='{val}' label='{txt[:80]}'")
 
         # ── Search each doc type ──────────────────────────────────────────────
         for code, (cat, cat_label, match_strings) in DOC_TYPES.items():
@@ -227,7 +202,6 @@ async def scrape_clerk(start_dt, end_dt):
             except Exception as e:
                 print(f"[clerk] {code} error: {e}")
                 traceback.print_exc()
-            # Reset form for next iteration
             frame = await reset_form(page)
 
         await browser.close()
@@ -235,7 +209,6 @@ async def scrape_clerk(start_dt, end_dt):
 
 
 async def reset_form(page):
-    """Navigate back to search page and return the correct frame."""
     try:
         await page.goto(CLERK_SEARCH, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(4000)
@@ -248,51 +221,31 @@ async def reset_form(page):
 
 async def search_one_type(frame, ctx, page, code, cat, cat_label,
                             match_strings, start_str, end_str):
-    # ── 1. Clear all instrument checkboxes ───────────────────────────────────
-    cleared = False
-    for sel in ["text=Clear All Instruments", "button:has-text('Clear All')"]:
+
+    # ── 1. Uncheck all checkboxes ─────────────────────────────────────────────
+    all_cbs = await frame.query_selector_all("input[type='checkbox']")
+    for cb in all_cbs:
         try:
-            await frame.click(sel, timeout=3000)
-            await frame.wait_for_timeout(500)
-            cleared = True
-            break
+            if await cb.is_checked():
+                await cb.click()
+                await frame.wait_for_timeout(20)
         except:
             pass
 
-    if not cleared:
-        all_cbs = await frame.query_selector_all("input[type='checkbox']")
-        for cb in all_cbs:
-            try:
-                if await cb.is_checked():
-                    await cb.click()
-                    await frame.wait_for_timeout(20)
-            except:
-                pass
-
-    # ── 2. Check only our target instrument ──────────────────────────────────
+    # ── 2. Check only our target checkbox by value ────────────────────────────
     checked = False
     all_cbs = await frame.query_selector_all("input[type='checkbox']")
 
     for cb in all_cbs:
         try:
-            cb_id  = await cb.get_attribute("id") or ""
-            cb_val = (await cb.get_attribute("value") or "").upper()
-            lbl_el = await frame.query_selector(f"label[for='{cb_id}']") if cb_id else None
-            if lbl_el:
-                label_text = (await lbl_el.inner_text()).strip().upper()
-            else:
-                label_text = (await cb.evaluate(
-                    "el => el.parentElement ? el.parentElement.innerText.trim() : ''"
-                )).upper()
-
-            combined = label_text + " " + cb_val
+            cb_val = (await cb.get_attribute("value") or "").strip().upper()
             for ms in match_strings:
-                if ms.upper() in combined:
+                if ms.upper() == cb_val:
                     if not await cb.is_checked():
                         await cb.click()
                         await frame.wait_for_timeout(100)
                     checked = True
-                    print(f"[{code}] ✓ checked: '{label_text[:50]}'")
+                    print(f"[{code}] ✓ checked checkbox: '{cb_val}'")
                     break
             if checked:
                 break
@@ -300,51 +253,37 @@ async def search_one_type(frame, ctx, page, code, cat, cat_label,
             print(f"[{code}] cb error: {e}")
 
     if not checked:
-        # Log available checkboxes for debugging
-        print(f"[{code}] ⚠ no matching checkbox. Available:")
-        for cb in all_cbs[:20]:
-            try:
-                val = await cb.get_attribute("value") or ""
-                txt = await cb.evaluate(
-                    "el => el.parentElement ? el.parentElement.innerText.trim() : ''"
-                )
-                print(f"    '{val}' / '{txt[:60]}'")
-            except: pass
+        print(f"[{code}] ⚠ no matching checkbox found for {match_strings}")
         return []
 
-    # ── 3. Fill Begin Date / End Date ────────────────────────────────────────
-    # Primary: find by placeholder="MM/DD/YYYY"
-    date_inputs = await frame.query_selector_all("input[placeholder='MM/DD/YYYY']")
-    if len(date_inputs) >= 2:
-        await date_inputs[0].triple_click()
-        await date_inputs[0].type(start_str)
-        await date_inputs[1].triple_click()
-        await date_inputs[1].type(end_str)
-        print(f"[{code}] ✓ dates filled: {start_str} → {end_str}")
-    else:
-        # Fallback: keyword search on name/id
-        filled = 0
-        for inp in await frame.query_selector_all("input[type='text'], input:not([type])"):
-            try:
-                nm  = (await inp.get_attribute("name") or "").lower()
-                id_ = (await inp.get_attribute("id") or "").lower()
-                ph  = (await inp.get_attribute("placeholder") or "").lower()
-                combined = nm + id_ + ph
-                if any(k in combined for k in ["begin", "start", "beg", "from"]) and filled == 0:
-                    await inp.triple_click()
-                    await inp.type(start_str)
-                    filled += 1
-                elif any(k in combined for k in ["end", "stop", "to"]) and filled <= 1:
-                    await inp.triple_click()
-                    await inp.type(end_str)
-                    filled += 1
-            except:
-                pass
-        if filled:
-            print(f"[{code}] ✓ dates filled via fallback ({filled} fields)")
-        else:
-            print(f"[{code}] ⚠ could not fill dates")
-            save_debug(f"no_dates_{code}", await frame.content())
+    # ── 3. Fill start_date / end_date ─────────────────────────────────────────
+    filled = 0
+    for inp in await frame.query_selector_all("input[type='text'], input:not([type])"):
+        try:
+            nm  = (await inp.get_attribute("name") or "").lower()
+            id_ = (await inp.get_attribute("id")   or "").lower()
+            combined = nm + " " + id_
+
+            if "start_date" in combined and filled == 0:
+                await inp.triple_click()
+                await inp.fill("")
+                await inp.type(start_str, delay=50)
+                filled += 1
+                print(f"[{code}] ✓ start_date: {start_str}")
+
+            elif "end_date" in combined and filled == 1:
+                await inp.triple_click()
+                await inp.fill("")
+                await inp.type(end_str, delay=50)
+                filled += 1
+                print(f"[{code}] ✓ end_date: {end_str}")
+
+        except Exception as e:
+            print(f"[{code}] date fill error: {e}")
+
+    if filled < 2:
+        print(f"[{code}] ⚠ only filled {filled}/2 date fields")
+        save_debug(f"no_dates_{code}", await frame.content())
 
     await frame.wait_for_timeout(500)
 
@@ -370,7 +309,6 @@ async def search_one_type(frame, ctx, page, code, cat, cat_label,
     # ── 5. Wait for results ───────────────────────────────────────────────────
     await page.wait_for_timeout(4000)
 
-    # Find the frame containing results
     results_frame = frame
     for f in page.frames:
         try:
@@ -575,7 +513,6 @@ def score_record(rec, week_ago):
     if cat == "NOFC":    flags.append("Pre-foreclosure");  score += 10
     if cat == "JUD":     flags.append("Judgment lien");    score += 10
     if cat == "LNTAX":   flags.append("Tax lien");         score += 10
-    if code == "LNMECH": flags.append("Mechanic lien");    score += 10
     if cat == "PRO":     flags.append("Probate / estate"); score += 10
     if re.search(r"\bLLC\b|\bINC\b|\bCORP\b", owner):
         flags.append("LLC/corp owner"); score += 10
