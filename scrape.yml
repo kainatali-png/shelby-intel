@@ -1,0 +1,78 @@
+name: Shelby County Clerk – Scrape New Business List
+
+on:
+  # Run on a schedule (daily at 08:00 UTC) and allow manual triggers
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Start date (MM/DD/YYYY)"
+        required: false
+        default: "04/01/2026"
+      end_date:
+        description: "End date (MM/DD/YYYY)"
+        required: false
+        default: "04/14/2026"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ── 1. Checkout repo ────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Python + dependencies ────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python packages
+        run: |
+          pip install --upgrade pip
+          pip install playwright
+
+      # ── 3. Install Playwright browser ──────────────────────────────────
+      - name: Install Chromium
+        run: playwright install chromium --with-deps
+
+      # ── 4. Override dates if provided via workflow_dispatch ─────────────
+      - name: Patch date range (manual trigger only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          START: ${{ github.event.inputs.start_date }}
+          END:   ${{ github.event.inputs.end_date }}
+        run: |
+          sed -i "s|START_DATE  = .*|START_DATE  = \"$START\"|" shelby_county_scraper.py
+          sed -i "s|END_DATE    = .*|END_DATE    = \"$END\"|"   shelby_county_scraper.py
+          echo "Dates patched: $START → $END"
+
+      # ── 5. Run scraper ──────────────────────────────────────────────────
+      - name: Run scraper
+        run: python shelby_county_scraper.py
+
+      # ── 6. Upload artefacts ─────────────────────────────────────────────
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shelby-scrape-results
+          path: |
+            data/records.json
+            data/leads_ghl.csv
+          retention-days: 30
+
+      # ── 7. Commit results back to repo (optional) ───────────────────────
+      - name: Commit results
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/records.json data/leads_ghl.csv || true
+          git diff --cached --quiet || git commit -m "chore: update scraped data $(date -u +%Y-%m-%d)"
+          git push || true
